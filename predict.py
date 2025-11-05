@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import mediapy
 import torch
@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torchvision.transforms as T
 from cog import BasePredictor, Input, Path as CogPath
 from einops import rearrange
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torchvision.io import read_video
 from torchvision.transforms import Compose, Lambda, Normalize
@@ -36,17 +36,29 @@ os.environ.setdefault("HF_HOME", MODEL_CACHE)
 os.environ.setdefault("TORCH_HOME", MODEL_CACHE)
 os.environ.setdefault("HF_DATASETS_CACHE", MODEL_CACHE)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", MODEL_CACHE)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 Path(MODEL_CACHE).mkdir(parents=True, exist_ok=True)
 
 CKPT_DIR = Path(MODEL_CACHE) / "weights"
 WHEEL_DIR = Path(MODEL_CACHE) / "wheels"
 
-WEIGHT_FILES = {
-    "dit": "seedvr2_ema_3b.pth",
+SHARED_WEIGHT_FILES = {
     "vae": "ema_vae.pth",
     "pos_emb": "pos_emb.pt",
     "neg_emb": "neg_emb.pt",
 }
+
+MODEL_VARIANTS = {
+    "3b": {
+        "dit_weight": "seedvr2_ema_3b.pth",
+        "config": "configs_3b/main.yaml",
+    },
+    "7b": {
+        "dit_weight": "seedvr2_ema_7b.pth",
+        "config": "configs_7b/main.yaml",
+    },
+}
+DEFAULT_MODEL_VARIANT = "3b"
 
 APEX_WHEEL = "apex-0.1-cp310-cp310-linux_x86_64.whl"
 FLASH_ATTN_SPEC = "flash_attn"
@@ -165,31 +177,18 @@ class Predictor(BasePredictor):
         self._ensure_flash_attn()
         self._ensure_apex()
 
-        dit_path = ensure_weight(WEIGHT_FILES["dit"])
-        vae_path = ensure_weight(WEIGHT_FILES["vae"])
-        pos_emb_path = ensure_weight(WEIGHT_FILES["pos_emb"])
-        neg_emb_path = ensure_weight(WEIGHT_FILES["neg_emb"])
-        self.pos_emb = torch.load(pos_emb_path, map_location=self.device, weights_only=True)
-        self.neg_emb = torch.load(neg_emb_path, map_location=self.device, weights_only=True)
+        self.shared_weights = {name: ensure_weight(path) for name, path in SHARED_WEIGHT_FILES.items()}
+        self.pos_emb = torch.load(self.shared_weights["pos_emb"], map_location=self.device, weights_only=True)
+        self.neg_emb = torch.load(self.shared_weights["neg_emb"], map_location=self.device, weights_only=True)
 
-        config_path = Path("configs_3b") / "main.yaml"
-        self.config = load_config(str(config_path))
-        OmegaConf.set_readonly(self.config, False)
-        dit_model = self.config.dit.model
-        dit_model.norm = "rms"
-        dit_model.vid_out_norm = "rms"
-        if hasattr(dit_model, "txt_in_norm"):
-            dit_model.txt_in_norm = "layer"
-        if hasattr(dit_model, "qk_norm"):
-            dit_model.qk_norm = "rms"
+        self.runners: Dict[str, VideoDiffusionInfer] = {}
+        self.configs: Dict[str, DictConfig] = {}
+        self.runner_devices: Dict[str, str] = {}
+        self.active_variant: Optional[str] = None
 
         init_torch(cudnn_benchmark=False)
-
-        self.runner = VideoDiffusionInfer(self.config)
-        self.runner.configure_dit_model(device="cuda", checkpoint=str(dit_path))
-        self.runner.configure_vae_model()
-        if hasattr(self.runner.vae, "set_memory_limit"):
-            self.runner.vae.set_memory_limit(**self.runner.config.vae.memory_limit)
+        self._instantiate_runner(DEFAULT_MODEL_VARIANT)
+        self.active_variant = DEFAULT_MODEL_VARIANT
 
         if not getattr(self, "_destroy_registered", False):
             atexit.register(self._maybe_destroy_pg)
@@ -214,6 +213,75 @@ class Predictor(BasePredictor):
                 Rearrange("t c h w -> c t h w"),
             ]
         )
+
+    def _instantiate_runner(self, variant: str) -> VideoDiffusionInfer:
+        if variant in self.runners:
+            return self.runners[variant]
+
+        if variant not in MODEL_VARIANTS:
+            raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+
+        spec = MODEL_VARIANTS[variant]
+        dit_path = ensure_weight(spec["dit_weight"])
+        config = load_config(spec["config"])
+        OmegaConf.set_readonly(config, False)
+        dit_model = config.dit.model
+        dit_model.norm = "rms"
+        dit_model.vid_out_norm = "rms"
+        if hasattr(dit_model, "txt_in_norm"):
+            dit_model.txt_in_norm = "layer"
+        if hasattr(dit_model, "qk_norm"):
+            dit_model.qk_norm = "rms"
+
+        runner = VideoDiffusionInfer(config)
+        runner.configure_dit_model(device="cuda", checkpoint=str(dit_path))
+        runner.configure_vae_model()
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+
+        self.runners[variant] = runner
+        self.configs[variant] = config
+        self.runner_devices[variant] = "cuda"
+        return runner
+
+    def _stage_runner_to_cpu(self, variant: Optional[str]) -> None:
+        if variant is None:
+            return
+        runner = self.runners.get(variant)
+        if runner is None or self.runner_devices.get(variant) == "cpu":
+            return
+        runner.dit.to("cpu")
+        runner.vae.to("cpu")
+        runner.device = "cpu"
+        self.runner_devices[variant] = "cpu"
+
+    def _ensure_runner_on_cuda(self, variant: str) -> VideoDiffusionInfer:
+        runner = self._instantiate_runner(variant)
+        if self.runner_devices.get(variant) == "cuda":
+            return runner
+        runner.dit.to(self.device)
+        runner.vae.to(self.device)
+        runner.device = "cuda"
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+        self.runner_devices[variant] = "cuda"
+        return runner
+
+    def _switch_active_runner(self, variant: str) -> VideoDiffusionInfer:
+        if variant not in MODEL_VARIANTS:
+            raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+
+        if variant == self.active_variant and self.runner_devices.get(variant) == "cuda":
+            return self.runners[variant]
+
+        previous = self.active_variant
+        if previous != variant:
+            self._stage_runner_to_cpu(previous)
+            torch.cuda.empty_cache()
+
+        runner = self._ensure_runner_on_cuda(variant)
+        self.active_variant = variant
+        return runner
 
     def predict(
         self,
@@ -259,6 +327,11 @@ class Predictor(BasePredictor):
             ge=10,
             le=100,
         ),
+        model_variant: str = Input(
+            description="Model size to run.",
+            choices=list(MODEL_VARIANTS.keys()),
+            default=DEFAULT_MODEL_VARIANT,
+        ),
     ) -> CogPath:
         input_path = Path(media)
         if not input_path.exists():
@@ -276,10 +349,12 @@ class Predictor(BasePredictor):
         sp_size_val = int(_resolve_numeric(sp_size, 1))
         seed_val = int(_resolve_numeric(seed if seed is not None else torch.randint(0, 2**32, ()).item(), 666))
 
-        self.runner.config.diffusion.cfg.scale = cfg_scale_val
-        self.runner.config.diffusion.cfg.rescale = 0.0
-        self.runner.config.diffusion.timesteps.sampling.steps = sample_steps_val
-        self.runner.configure_diffusion()
+        runner = self._switch_active_runner(model_variant)
+        config = self.configs[model_variant]
+        config.diffusion.cfg.scale = cfg_scale_val
+        config.diffusion.cfg.rescale = 0.0
+        config.diffusion.timesteps.sampling.steps = sample_steps_val
+        runner.configure_diffusion()
 
         set_seed(seed_val, same_across_ranks=True)
 
@@ -312,8 +387,8 @@ class Predictor(BasePredictor):
             cond_latents = [cut_videos(cond, sp_size_val) for cond in cond_latents]
 
         with torch.inference_mode():
-            cond_latents = self.runner.vae_encode(cond_latents)
-            samples = self._generation_step(cond_latents, text_embeds)
+            cond_latents = runner.vae_encode(cond_latents)
+            samples = self._generation_step(runner, cond_latents, text_embeds)
 
         sample = samples[0]
         if ori_lengths[0] < sample.shape[0]:
@@ -342,7 +417,7 @@ class Predictor(BasePredictor):
         torch.cuda.empty_cache()
         return CogPath(str(output_name))
 
-    def _generation_step(self, cond_latents, text_embeds):
+    def _generation_step(self, runner: VideoDiffusionInfer, cond_latents, text_embeds):
         noises = [torch.randn_like(latent) for latent in cond_latents]
         aug_noises = [torch.randn_like(latent) for latent in cond_latents]
         noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
@@ -356,16 +431,16 @@ class Predictor(BasePredictor):
         def _add_noise(x, aug_noise):
             t = torch.tensor([1000.0], device=self.device) * cond_noise_scale
             shape = torch.tensor(x.shape[1:], device=self.device)[None]
-            t = self.runner.timestep_transform(t, shape)
-            return self.runner.schedule.forward(x, aug_noise, t)
+            t = runner.timestep_transform(t, shape)
+            return runner.schedule.forward(x, aug_noise, t)
 
         conditions = [
-            self.runner.get_condition(noise, task="sr", latent_blur=_add_noise(latent_blur, aug_noise))
+            runner.get_condition(noise, task="sr", latent_blur=_add_noise(latent_blur, aug_noise))
             for noise, aug_noise, latent_blur in zip(noises, aug_noises, cond_latents)
         ]
 
-        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
-            video_tensors = self.runner.inference(
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            video_tensors = runner.inference(
                 noises=noises,
                 conditions=conditions,
                 dit_offload=False,

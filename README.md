@@ -57,6 +57,7 @@ Replicate or locally with the same configuration.
 | `seed` | integer? | Optional random seed (auto-randomized when omitted). | random |
 | `output_format` | string | Image output format when `media` is an image. | `webp` |
 | `output_quality` | integer | JPEG/WebP quality when using lossy formats. | `90` |
+| `model_variant` | string | Choose between the 3B and 7B checkpoints (`"3b"` or `"7b"`). | `3b` |
 
 ## Outputs
 
