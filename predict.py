@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, TYPE_CHECKING, Union
 
 import mediapy
 import torch
@@ -26,19 +26,18 @@ from common.seed import set_seed
 from data.image.transforms.divisible_crop import DivisibleCrop
 from data.image.transforms.na_resize import NaResize
 from data.video.transforms.rearrange import Rearrange
+from media_utils import cut_videos, mux_audio_stream
 from model_manager import ModelSpec, RunnerManager
+from weights import CKPT_DIR, MODEL_CACHE, WHEEL_DIR, ensure_model_cache, ensure_weight
 
-MODEL_CACHE = "model_cache"
-BASE_URL = "https://weights.replicate.delivery/default/seedvr2/model_cache/"
-os.environ.setdefault("HF_HOME", MODEL_CACHE)
-os.environ.setdefault("TORCH_HOME", MODEL_CACHE)
-os.environ.setdefault("HF_DATASETS_CACHE", MODEL_CACHE)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", MODEL_CACHE)
+if TYPE_CHECKING:
+    from projects.video_diffusion_sr.infer import VideoDiffusionInfer
+
+os.environ.setdefault("HF_HOME", str(MODEL_CACHE))
+os.environ.setdefault("TORCH_HOME", str(MODEL_CACHE))
+os.environ.setdefault("HF_DATASETS_CACHE", str(MODEL_CACHE))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(MODEL_CACHE))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-Path(MODEL_CACHE).mkdir(parents=True, exist_ok=True)
-
-CKPT_DIR = Path(MODEL_CACHE) / "weights"
-WHEEL_DIR = Path(MODEL_CACHE) / "wheels"
 
 SHARED_WEIGHT_FILES = {
     "vae": "ema_vae.pth",
@@ -165,7 +164,7 @@ class Predictor(BasePredictor):
 
         self.device = torch.device("cuda")
 
-        self._ensure_model_cache()
+        ensure_model_cache()
         self._ensure_flash_attn()
         self._ensure_apex()
 
@@ -339,7 +338,7 @@ class Predictor(BasePredictor):
         torch.cuda.empty_cache()
         return CogPath(str(output_name))
 
-    def _generation_step(self, runner: VideoDiffusionInfer, cond_latents, text_embeds):
+    def _generation_step(self, runner: "VideoDiffusionInfer", cond_latents, text_embeds):
         noises = [torch.randn_like(latent) for latent in cond_latents]
         aug_noises = [torch.randn_like(latent) for latent in cond_latents]
         noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
@@ -375,19 +374,6 @@ class Predictor(BasePredictor):
             for video in video_tensors
         ]
         return samples
-
-    def _ensure_model_cache(self) -> None:
-        Path(MODEL_CACHE).mkdir(parents=True, exist_ok=True)
-        for model_file in MODEL_FILES:
-            url = BASE_URL + model_file
-            dest_path = Path(MODEL_CACHE) / model_file
-            if model_file.endswith(".tar"):
-                extracted_path = dest_path.parent / model_file.replace(".tar", "")
-                if extracted_path.exists():
-                    continue
-            elif dest_path.exists():
-                continue
-            download_weights(url, str(dest_path))
 
     @staticmethod
     def _maybe_destroy_pg():
