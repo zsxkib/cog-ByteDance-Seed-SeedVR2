@@ -69,6 +69,7 @@ FLASH_ATTN_SPEC = "flash_attn"
 MODEL_FILES = [
     ".cache.tar",
     "version.txt",
+    "version_diffusers_cache.txt",
     "weights.tar",
     "wheels.tar",
     "xet.tar",
@@ -177,26 +178,26 @@ def ensure_model_cache() -> None:
         download_weights(url, dest_path)
 
 
-class RunnerManager:
-    def __init__(self, device: torch.device) -> None:
+class LazyRunnerManager:
+    def __init__(self, device: torch.device, builder) -> None:
         self._device = device
+        self._builder = builder
         self._bundles: Dict[str, Dict] = {}
         self._active: Optional[str] = None
 
     def use(self, variant: str) -> Tuple["VideoDiffusionInfer", OmegaConf]:
-        if variant not in MODEL_VARIANTS:
-            raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
-
         bundle = self._bundles.get(variant)
         previous = self._active if self._active in self._bundles else None
 
         if bundle is None:
-            if previous:
+            if previous is not None:
                 self._move_to_cpu(self._bundles[previous])
                 torch.cuda.empty_cache()
-            bundle = self._build_runner(variant)
+            runner, config = self._builder(variant)
+            bundle = {"runner": runner, "config": config, "device": "cuda"}
+            self._bundles[variant] = bundle
         else:
-            if previous and previous != variant:
+            if previous is not None and previous != variant:
                 self._move_to_cpu(self._bundles[previous])
                 torch.cuda.empty_cache()
             if bundle["device"] != "cuda":
@@ -204,30 +205,6 @@ class RunnerManager:
 
         self._active = variant
         return bundle["runner"], bundle["config"]
-
-    def _build_runner(self, variant: str) -> Dict:
-        spec = MODEL_VARIANTS[variant]
-        weight_path = ensure_weight(spec.weight)
-        config = load_config(spec.config)
-        OmegaConf.set_readonly(config, False)
-
-        dit_model = config.dit.model
-        dit_model.norm = "rms"
-        dit_model.vid_out_norm = "rms"
-        if hasattr(dit_model, "txt_in_norm"):
-            dit_model.txt_in_norm = "layer"
-        if hasattr(dit_model, "qk_norm"):
-            dit_model.qk_norm = "rms"
-
-        runner = VideoDiffusionInfer(config)
-        runner.configure_dit_model(device="cuda", checkpoint=str(weight_path))
-        runner.configure_vae_model()
-        if hasattr(runner.vae, "set_memory_limit"):
-            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
-
-        bundle = {"runner": runner, "config": config, "device": "cuda"}
-        self._bundles[variant] = bundle
-        return bundle
 
     def _move_to_cuda(self, bundle: Dict) -> None:
         runner: VideoDiffusionInfer = bundle["runner"]
@@ -271,8 +248,17 @@ class Predictor(BasePredictor):
 
         init_torch(cudnn_benchmark=False)
 
-        self.runners = RunnerManager(device=self.device)
-        self.runners.use(DEFAULT_MODEL_VARIANT)
+        self.dual_load = self._should_preload_all_variants()
+        if self.dual_load:
+            self.runners: Dict[str, VideoDiffusionInfer] = {}
+            self.configs: Dict[str, OmegaConf] = {}
+            for variant in MODEL_VARIANTS:
+                runner, config = self._build_runner(variant)
+                self.runners[variant] = runner
+                self.configs[variant] = config
+        else:
+            self.lazy_runners = LazyRunnerManager(self.device, self._build_runner)
+            self.lazy_runners.use(DEFAULT_MODEL_VARIANT)
 
         if not getattr(self, "_destroy_registered", False):
             atexit.register(self._maybe_destroy_pg)
@@ -364,7 +350,14 @@ class Predictor(BasePredictor):
         sp_size_val = int(_resolve_numeric(sp_size, 1))
         seed_val = int(_resolve_numeric(seed if seed is not None else torch.randint(0, 2**32, ()).item(), 666))
 
-        runner, config = self.runners.use(model_variant)
+        if model_variant not in MODEL_VARIANTS:
+            raise ValueError(f"Unknown model variant '{model_variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+
+        if self.dual_load:
+            runner = self.runners[model_variant]
+            config = self.configs[model_variant]
+        else:
+            runner, config = self.lazy_runners.use(model_variant)
         config.diffusion.cfg.scale = cfg_scale_val
         config.diffusion.cfg.rescale = 0.0
         config.diffusion.timesteps.sampling.steps = sample_steps_val
@@ -430,6 +423,46 @@ class Predictor(BasePredictor):
 
         torch.cuda.empty_cache()
         return CogPath(str(output_name))
+
+    def _build_runner(self, variant: str) -> Tuple["VideoDiffusionInfer", OmegaConf]:
+        spec = MODEL_VARIANTS.get(variant)
+        if spec is None:
+            raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+        weight_path = ensure_weight(spec.weight)
+        config = load_config(spec.config)
+        OmegaConf.set_readonly(config, False)
+
+        dit_model = config.dit.model
+        dit_model.norm = "rms"
+        dit_model.vid_out_norm = "rms"
+        if hasattr(dit_model, "txt_in_norm"):
+            dit_model.txt_in_norm = "layer"
+        if hasattr(dit_model, "qk_norm"):
+            dit_model.qk_norm = "rms"
+
+        runner = VideoDiffusionInfer(config)
+        runner.configure_dit_model(device="cuda", checkpoint=str(weight_path))
+        runner.configure_vae_model()
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+
+        return runner, config
+
+    def _should_preload_all_variants(self) -> bool:
+        env_force_stage = os.getenv("SEEDVR_FORCE_STAGE", "").lower()
+        if env_force_stage in {"1", "true", "yes"}:
+            return False
+
+        env_force_dual = os.getenv("SEEDVR_FORCE_DUAL_LOAD", "").lower()
+        if env_force_dual in {"1", "true", "yes"}:
+            return True
+
+        try:
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+        except (RuntimeError, AttributeError):
+            return False
+
+        return total_mem >= 120 * 1024**3
 
     def _generation_step(self, runner: "VideoDiffusionInfer", cond_latents, text_embeds):
         noises = [torch.randn_like(latent) for latent in cond_latents]
