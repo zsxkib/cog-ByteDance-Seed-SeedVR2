@@ -81,8 +81,8 @@ Replicate or locally with the same configuration.
 
 ```bash
 pip install cog
-git clone https://github.com/zsxkib/cog-ByteDance-Seed-SeedVR2-3B.git
-cd cog-ByteDance-Seed-SeedVR2-3B
+git clone https://github.com/zsxkib/cog-ByteDance-Seed-SeedVR2.git
+cd cog-ByteDance-Seed-SeedVR2
 cog predict -i media=@test_videos/01.mp4
 ```
 
