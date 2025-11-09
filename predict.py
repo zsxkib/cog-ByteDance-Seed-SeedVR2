@@ -33,6 +33,10 @@ from data.image.transforms.divisible_crop import DivisibleCrop
 from data.image.transforms.na_resize import NaResize
 from data.video.transforms.rearrange import Rearrange
 from projects.video_diffusion_sr.infer import VideoDiffusionInfer
+try:
+    from projects.video_diffusion_sr.color_fix import wavelet_reconstruction
+except ImportError:  # pragma: no cover - optional dependency
+    wavelet_reconstruction = None
 
 MODEL_CACHE = Path("model_cache")
 BASE_URL = "https://weights.replicate.delivery/default/seedvr2/model_cache/"
@@ -299,7 +303,7 @@ class Predictor(BasePredictor):
             le=4,
         ),
         sp_size: int = Input(
-            description="Sequence-parallel shard count. Increase for long clips.",
+            description="Sequence-parallel shard heuristic (single-GPU build only accepts 1).",
             default=1,
             ge=1,
             le=4,
@@ -325,6 +329,10 @@ class Predictor(BasePredictor):
             ge=10,
             le=100,
         ),
+        apply_color_fix: bool = Input(
+            description="Apply optional wavelet color correction (matches official demo).",
+            default=False,
+        ),
         model_variant: str = Input(
             description="Model size to run.",
             choices=list(MODEL_VARIANTS.keys()),
@@ -341,6 +349,10 @@ class Predictor(BasePredictor):
         fps_val = int(fps)
         sp_size_val = int(sp_size)
         seed_val = int(seed if seed is not None else torch.randint(0, 2**32, ()).item())
+        if sp_size_val != 1:
+            print(
+                "[WARN] sp_size>1 requested on single-GPU build; proceeding with padding-only heuristic."
+            )
 
         if model_variant not in MODEL_VARIANTS:
             raise ValueError(f"Unknown model variant '{model_variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
@@ -365,6 +377,7 @@ class Predictor(BasePredictor):
         # single item list, process directly
         cond_latents = []
         ori_lengths = []
+        color_fix_refs = []
 
         if media_kind == "video":
             frames, _, _ = read_video(str(input_path), output_format="TCHW", pts_unit="sec")
@@ -381,6 +394,7 @@ class Predictor(BasePredictor):
 
         cond_latents.append(cond)
         ori_lengths.append(cond.size(1))
+        color_fix_refs.append(cond.detach())
 
         if media_kind == "video":
             cond_latents = [cut_videos(cond, sp_size_val) for cond in cond_latents]
@@ -393,8 +407,22 @@ class Predictor(BasePredictor):
         if ori_lengths[0] < sample.shape[0]:
             sample = sample[: ori_lengths[0]]
 
+        if apply_color_fix and wavelet_reconstruction is not None:
+            reference = color_fix_refs[0]
+            reference = (
+                rearrange(reference[:, None], "c t h w -> t c h w")
+                if reference.ndim == 3
+                else rearrange(reference, "c t h w -> t c h w")
+            )
+            sample = wavelet_reconstruction(
+                sample.to("cpu"),
+                reference[: sample.size(0)].to("cpu"),
+            )
+        else:
+            sample = sample.to("cpu")
+
         sample = rearrange(sample[:, None], "t c h w -> t h w c") if sample.ndim == 3 else rearrange(sample, "t c h w -> t h w c")
-        sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).cpu().numpy()
+        sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).numpy()
 
         if media_kind == "image":
             img_array = sample[0]
